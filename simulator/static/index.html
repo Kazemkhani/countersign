@@ -246,6 +246,10 @@
         margin: 0;
         overflow-wrap: anywhere;
       }
+      .why {
+        color: var(--muted);
+        font-size: 12px;
+      }
       #calls {
         max-height: 40vh;
         overflow-y: auto;
@@ -315,6 +319,13 @@
           <h2>Tool calls this session</h2>
           <div id="calls"><p class="row">None yet.</p></div>
         </section>
+        <section aria-label="Receipts" style="margin-top: 16px">
+          <h2>Receipts kept by the device</h2>
+          <div id="receipts"><p class="row">None yet.</p></div>
+          <div class="row">
+            <button type="button" id="checkReceipts">Check receipts against the ledger</button>
+          </div>
+        </section>
       </aside>
     </main>
     <script>
@@ -367,11 +378,32 @@
             t.status == null
               ? ""
               : `<span class="chip ${t.status}">${t.status}</span>`;
-          d.innerHTML = `<strong></strong>${status}<br><code></code>`;
+          d.innerHTML = `<strong></strong>${status}<br><code></code><div class="why"></div>`;
           d.querySelector("strong").textContent = t.name;
           d.querySelector("code").textContent = JSON.stringify(t.input);
+          d.querySelector(".why").textContent = (t.reasons || []).join("; ");
           $("calls").prepend(d);
+          if (t.receipt) addReceipt({ ...t.receipt, status: "kept" });
         }
+      }
+
+      function addReceipt(r) {
+        if ($("receipts").querySelector("p")) $("receipts").innerHTML = "";
+        const d = document.createElement("div");
+        d.className = "call";
+        d.dataset.seq = r.ledger_seq;
+        d.innerHTML = `<strong></strong><span class="chip"></span><br><code></code>`;
+        d.querySelector("strong").textContent = `${r.order_id} (entry ${r.ledger_seq})`;
+        d.querySelector(".chip").textContent = r.status;
+        d.querySelector(".chip").className = "chip " + (r.status === "kept" ? "" : r.status);
+        d.querySelector("code").textContent = r.ledger_hash.slice(0, 24) + "...";
+        $("receipts").appendChild(d);
+      }
+
+      async function checkReceipts() {
+        const results = await (await fetch("/api/receipts")).json();
+        $("receipts").innerHTML = results.length ? "" : '<p class="row">None yet.</p>';
+        for (const r of results) addReceipt({ ...r, status: r.ok ? "verified" : "altered" });
       }
 
       function speak(text) {
@@ -402,7 +434,7 @@
             add("err", "Error", out.error);
             return;
           }
-          add("dev", "Device", out.reply);
+          add("dev", out.from_countersign ? "Device (Countersign's words)" : "Device", out.reply);
           addCalls(out.tools || []);
           speak(out.reply);
           probe();
@@ -439,8 +471,10 @@
       $("reset").onclick = async () => {
         await fetch("/api/reset", { method: "POST" });
         $("log").innerHTML = "";
+        $("calls").innerHTML = '<p class="row">None yet.</p>';
       };
       $("reprobe").onclick = probe;
+      $("checkReceipts").onclick = checkReceipts;
 
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (SR) {

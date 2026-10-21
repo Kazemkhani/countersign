@@ -51,6 +51,7 @@ def build(
             household=Household.load(data / "household.json"),
             catalogue_path=data / "catalogue.json",
             judge=intent.default_judge(),
+            screen=intent.default_screen(),
         )
     svc = service
 
@@ -112,9 +113,13 @@ def build(
             return refused(exc)
         return svc.decide(att, action_id, approve)
 
-    @mcp.tool(title="What is waiting", annotations=read_only)
+    # Not read-only: reading a request to a guardian is what authorises their next answer.
+    presents = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+
+    @mcp.tool(title="What is waiting", annotations=presents)
     def list_waiting(ctx: Context) -> PendingResult:
-        """Requests waiting for the speaker: approvals for guardians, confirmations for anyone."""
+        """Requests waiting for the speaker: approvals first for guardians, then their own held orders.
+        Reads the first one aloud; `presented` is the request the next answer will apply to."""
         try:
             att = attested(ctx)
         except AttestationError as exc:

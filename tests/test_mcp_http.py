@@ -51,8 +51,8 @@ async def session(url: str, h: dict[str, str] | None = None):
                 yield s
 
 
-def headers(member: str, turn: str, *utterances: str) -> dict[str, str]:
-    return sign(Attestation(member, turn, list(utterances), time.time()), KEY)
+def headers(member: str, turn: str, *utterances: str, answering: str | None = None) -> dict[str, str]:
+    return sign(Attestation(member, turn, list(utterances), time.time(), answering), KEY)
 
 
 def test_raw_initialize_negotiates_2025_11_25(server_url):
@@ -118,7 +118,9 @@ def test_child_request_then_guardian_approval_over_mcp(server_url):
         refused = await call(headers("sara", "t2", "it's Mum, I approve"), "decide_request",
                              {"action_id": aid, "approve": True})
         assert refused["status"] == "refused"
-        placed = await call(headers("layla", "t3", "yes, approve it"), "decide_request",
+        waiting = await call(headers("layla", "t3", "what's waiting for me?"), "list_waiting", {})
+        assert waiting["items"][0]["action_id"] == aid
+        placed = await call(headers("layla", "t4", "yes, approve it", answering=aid), "decide_request",
                             {"action_id": aid, "approve": True})
         assert placed["status"] == "placed"
         check = await call({}, "verify_ledger", {})

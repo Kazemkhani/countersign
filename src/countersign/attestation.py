@@ -7,8 +7,12 @@ Countersign and sends them as HTTP headers on every MCP request. A tool call
 whose arguments disagree with the attested facts loses.
 
 Headers:
-  X-Countersign-Attestation: base64url(JSON {member_id, turn_id, utterances, issued_at})
+  X-Countersign-Attestation: base64url(JSON {member_id, turn_id, utterances, issued_at, answering})
   X-Countersign-Signature:   hex HMAC-SHA256 of the raw base64url string
+
+`answering` is the id of the request whose question the device last read aloud
+to this person (from Countersign's own `say` text), or null. A yes only counts
+for that request.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ class Attestation:
     turn_id: str
     utterances: list[str] = field(default_factory=list)  # most recent last
     issued_at: float = 0.0
+    answering: str | None = None
 
     @property
     def latest(self) -> str:
@@ -43,7 +48,8 @@ class Attestation:
 
 def sign(att: Attestation, key: bytes) -> dict[str, str]:
     body = json.dumps(
-        {"member_id": att.member_id, "turn_id": att.turn_id, "utterances": att.utterances, "issued_at": att.issued_at},
+        {"member_id": att.member_id, "turn_id": att.turn_id, "utterances": att.utterances,
+         "issued_at": att.issued_at, "answering": att.answering},
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
@@ -69,4 +75,6 @@ def verify(headers: dict[str, str], key: bytes, now: float | None = None) -> Att
     if abs((now if now is not None else time.time()) - issued) > MAX_AGE_SECONDS:
         raise AttestationError("host attestation has expired")
     utterances = [str(u) for u in data.get("utterances", [])][-5:]
-    return Attestation(str(data["member_id"]), str(data["turn_id"]), utterances, issued)
+    answering = data.get("answering")
+    return Attestation(str(data["member_id"]), str(data["turn_id"]), utterances, issued,
+                       str(answering) if answering else None)

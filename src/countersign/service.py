@@ -24,12 +24,31 @@ from .ledger import Ledger
 from .policy import Household, Verdict, evaluate
 
 CONFIRM_WINDOW = timedelta(minutes=10)
+APPROVAL_WINDOW = timedelta(hours=24)
 
-AFFIRM = re.compile(
-    r"\b(yes|yeah|yep|confirm(ed)?|go ahead|approve[ds]?|do it|place (it|the order)|ok(ay)?|sure|that'?s right|correct)\b",
-    re.IGNORECASE,
+YES_START = re.compile(
+    r"^(yes|yeah|yep|yup|sure|ok|okay|confirm(ed)?|(i )?approve[ds]?( it)?|go ahead|do it|please do|"
+    r"place (it|the order)|that'?s (right|fine|correct))\b"
 )
-NEGATE = re.compile(r"\b(no|nope|cancel|don'?t|do not|stop|decline|deny|reject|never ?mind)\b", re.IGNORECASE)
+NO_ANY = re.compile(r"\b(no|nope|nah|cancel|decline[ds]?|don'?t|do not|stop|reject(ed)?|deny|denied|never ?mind)\b")
+UNSURE = re.compile(
+    r"\b(not|n't|unsure|maybe|perhaps|wait|hold on|hang on|let me|think|what|why|how|when|who|which|where)\b|\?"
+)
+
+
+def classify_answer(text: str) -> str:
+    """'yes', 'no' or 'unclear'. Deliberately strict: a yes must lead the answer, be
+    short and carry no doubt or question. Anything else is unclear, which leaves
+    the request waiting rather than placing it."""
+    t = re.sub(r"[^a-z0-9'?\s]", " ", text.lower()).strip()
+    t = re.sub(r"^(um+|uh+|hmm+|well|so|right)\s+", "", t)
+    if NO_ANY.search(t):
+        return "no"
+    if UNSURE.search(t):
+        return "unclear"
+    if YES_START.match(t) and len(t.split()) <= 8:
+        return "yes"
+    return "unclear"
 
 ACTIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS actions (
@@ -50,15 +69,21 @@ CREATE TABLE IF NOT EXISTS actions (
     receipt_hash  TEXT,
     decided_by    TEXT
 );
+-- one spoken answer settles at most one request
+CREATE TABLE IF NOT EXISTS used_turns (
+    turn_id    TEXT PRIMARY KEY,
+    member_id  TEXT NOT NULL,
+    action_id  TEXT NOT NULL
+);
+-- the request most recently read aloud to each guardian
+CREATE TABLE IF NOT EXISTS presented (
+    member_id  TEXT PRIMARY KEY,
+    action_id  TEXT NOT NULL,
+    turn_id    TEXT NOT NULL
+);
 """
 
 
-def words_affirm(text: str) -> bool:
-    return bool(AFFIRM.search(text)) and not NEGATE.search(text)
-
-
-def words_negate(text: str) -> bool:
-    return bool(NEGATE.search(text))
 
 
 # ---------- structured outputs (become MCP outputSchema) ----------
@@ -106,6 +131,7 @@ class PendingItem(BaseModel):
 
 class PendingResult(BaseModel):
     items: list[PendingItem]
+    presented: str | None = None  # the request just read aloud to a guardian, if any
     say: str
 
 
@@ -123,6 +149,7 @@ class ActivityResult(BaseModel):
     spent: float
     ledger_ok: bool
     ledger_entries: int
+    ledger_head: str = ""
     say: str
 
 
@@ -173,6 +200,7 @@ class Countersign:
         catalogue_path: str | Path,
         judge: intent_mod.Judge,
         clock: Callable[[], datetime] = _utc_now,
+        screen: intent_mod.GuardrailScreen | None = None,
     ):
         self.conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self.conn.executescript(ACTIONS_SCHEMA)
@@ -180,6 +208,7 @@ class Countersign:
         self.hh = household
         self.catalogue = {p["id"]: p for p in json.loads(Path(catalogue_path).read_text())["products"]}
         self.judge = judge
+        self.screen = screen
         self.clock = clock
         self.lock = threading.Lock()
 
@@ -205,15 +234,43 @@ class Countersign:
         self.conn.execute(f"UPDATE actions SET {cols} WHERE id = ?", (*fields.values(), action_id))
         self.conn.commit()
 
+    def _turn_used(self, turn_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM used_turns WHERE turn_id = ?", (turn_id,)).fetchone() is not None
+
+    def _use_turn(self, att: Attestation, action_id: str) -> None:
+        self.conn.execute("INSERT INTO used_turns VALUES (?, ?, ?)", (att.turn_id, att.member_id, action_id))
+        self.conn.commit()
+
+    _PROPOSED_STATUS = {"allow": "allowed", "confirm": "needs_confirmation",
+                        "needs_approval": "needs_approval", "block": "blocked"}
+
+    def _history(self) -> dict[str, dict]:
+        """Every request and its current state, rebuilt from the hash-chained ledger
+        rather than the editable actions table, so reports and budgets rest on the
+        record that verify_ledger checks."""
+        acts: dict[str, dict] = {}
+        for e in self.ledger.entries():
+            aid = e.payload.get("action_id")
+            if not aid:
+                continue
+            if e.kind == "proposed":
+                acts[aid] = {"when": e.ts, "member": e.payload["member"], "item": e.payload["item"],
+                             "quantity": e.payload["quantity"], "total": e.payload["total"],
+                             "merchant": e.payload["merchant"],
+                             "status": self._PROPOSED_STATUS.get(e.payload["verdict"], "unknown")}
+            elif aid in acts and e.kind in ("placed", "blocked", "declined", "expired"):
+                acts[aid]["status"] = e.kind
+                if e.kind == "placed":
+                    acts[aid]["placed_at"] = e.ts
+        return acts
+
     def _spent_since(self, since: datetime) -> float:
-        r = self.conn.execute(
-            "SELECT COALESCE(SUM(total), 0) FROM actions WHERE status = 'placed' AND created_at >= ?",
-            (since.isoformat(timespec="seconds"),),
-        ).fetchone()
-        return float(r[0])
+        cutoff = since.isoformat(timespec="seconds")
+        return round(sum(a["total"] for a in self._history().values()
+                         if a["status"] == "placed" and a.get("placed_at", "") >= cutoff), 2)
 
     def _merchants_used(self) -> set[str]:
-        return {r[0] for r in self.conn.execute("SELECT DISTINCT merchant FROM actions WHERE status = 'placed'")}
+        return {a["merchant"] for a in self._history().values() if a["status"] == "placed"}
 
     def _place(self, row: _Row, decided_by: str | None) -> Receipt:
         order_id = "SIM-" + secrets.token_hex(4).upper()
@@ -264,7 +321,7 @@ class Countersign:
             spent = self._spent_since(now - timedelta(days=7))
             decision = evaluate(self.hh, att.member_id, p["category"], p["merchant"], purchase.total, spent,
                                 self._merchants_used())
-            check = intent_mod.check(att.utterances, purchase, self.judge)
+            check = intent_mod.check(att.utterances, purchase, self.judge, self.screen)
             if check.injection_suspected:
                 decision.raise_to(Verdict.BLOCK, "the product listing tries to give the assistant instructions", front=True)
             if check.verdict == "mismatch":
@@ -327,18 +384,26 @@ class Countersign:
             if att.turn_id == row.propose_turn:
                 return ActionResult(action_id=action_id, status="refused",
                                     say="I need to hear you say yes before I place this.")
+            if att.answering != action_id:
+                return ActionResult(action_id=action_id, status="refused",
+                                    say="That answer was not to this question, so I have not placed it.")
+            if self._turn_used(att.turn_id):
+                return ActionResult(action_id=action_id, status="refused",
+                                    say="One answer settles one request. I have not placed this one.")
             if self.clock() - datetime.fromisoformat(row.created_at) > CONFIRM_WINDOW:
                 self._set(action_id, status="expired")
                 self.ledger.append("expired", {"action_id": action_id}, self._ts())
                 return ActionResult(action_id=action_id, status="declined", say="That request expired, so I dropped it.")
-            if words_negate(att.latest):
+            answer = classify_answer(att.latest)
+            if answer == "unclear":
+                return ActionResult(action_id=action_id, status="refused",
+                                    say="I did not hear a clear yes or no, so I have not placed it.")
+            self._use_turn(att, action_id)
+            if answer == "no":
                 self._set(action_id, status="declined", decided_by=att.member_id)
                 self.ledger.append("declined", {"action_id": action_id, "by": att.member_id, "heard": att.utterances[-1:]},
                                    self._ts())
                 return ActionResult(action_id=action_id, status="declined", say="Okay, I cancelled it.")
-            if not words_affirm(att.latest):
-                return ActionResult(action_id=action_id, status="refused",
-                                    say="I did not hear a clear yes, so I have not placed it.")
             self.ledger.append("confirmed", {"action_id": action_id, "by": att.member_id, "heard": att.utterances[-1:]},
                                self._ts())
             receipt = self._place(row, decided_by=att.member_id)
@@ -357,13 +422,24 @@ class Countersign:
                                    self._ts())
                 return ActionResult(action_id=action_id, status="refused",
                                     say=f"Only a guardian can decide this, and I recognised {self._name(att.member_id)}.")
-            heard_yes, heard_no = words_affirm(att.latest), words_negate(att.latest)
-            if approve and not heard_yes:
+            if self.clock() - datetime.fromisoformat(row.created_at) > APPROVAL_WINDOW:
+                self._set(action_id, status="expired")
+                self.ledger.append("expired", {"action_id": action_id}, self._ts())
+                return ActionResult(action_id=action_id, status="declined",
+                                    say="That request is more than a day old, so I dropped it. They can ask again.")
+            shown = self.conn.execute("SELECT action_id, turn_id FROM presented WHERE member_id = ?",
+                                      (att.member_id,)).fetchone()
+            if shown is None or shown[0] != action_id or shown[1] == att.turn_id or att.answering != action_id:
                 return ActionResult(action_id=action_id, status="refused",
-                                    say="I did not hear you approve it, so it is still waiting.")
-            if not approve and not heard_no:
+                                    say="Ask me what is waiting first, so I can read you the request before you decide.")
+            if self._turn_used(att.turn_id):
                 return ActionResult(action_id=action_id, status="refused",
-                                    say="I did not hear you decline it, so it is still waiting.")
+                                    say="One answer settles one request. This one is still waiting.")
+            answer = classify_answer(att.latest)
+            if answer != ("yes" if approve else "no"):
+                return ActionResult(action_id=action_id, status="refused",
+                                    say="Your answer did not match that decision, so the request is still waiting.")
+            self._use_turn(att, action_id)
             if not approve:
                 self._set(action_id, status="declined", decided_by=att.member_id)
                 self.ledger.append("declined", {"action_id": action_id, "by": att.member_id, "heard": att.utterances[-1:]},
@@ -382,41 +458,49 @@ class Countersign:
         if me is None:
             return PendingResult(items=[], say="I do not recognise you in this household.")
         rows = [self._row(r[0]) for r in self.conn.execute(
-            "SELECT id FROM actions WHERE status IN ('needs_approval','needs_confirmation') ORDER BY created_at")]
+            "SELECT id FROM actions WHERE status IN ('needs_approval','needs_confirmation') ORDER BY created_at, rowid")]
         visible = [r for r in rows if r and (r.member_id == me.id or (me.role == "guardian" and r.status == "needs_approval"))]
+        visible.sort(key=lambda r: r.status != "needs_approval")  # approvals first: that is what a guardian is asked
         items = [PendingItem(action_id=r.id, requested_by=self._name(r.member_id), item=r.title, quantity=r.quantity,
                              total=r.total, status=r.status, reasons=r.reasons, created_at=r.created_at) for r in visible]
         if not items:
             return PendingResult(items=[], say="Nothing is waiting for you.")
         first = items[0]
+        presented, question = None, ""
+        if me.role == "guardian" and first.status == "needs_approval":
+            self.conn.execute("INSERT OR REPLACE INTO presented VALUES (?, ?, ?)", (me.id, first.action_id, att.turn_id))
+            self.conn.commit()
+            presented, question = first.action_id, " Do you approve?"
+        elif first.status == "needs_confirmation" and visible[0].member_id == me.id:
+            presented, question = first.action_id, " Should I go ahead?"
         say = (f"{len(items)} waiting. First: {first.requested_by} asked for "
                f"{self._item(first.item, first.quantity)}, {self._money(first.total)}. "
-               f"Reason: {'; '.join(first.reasons[:2])}.")
-        return PendingResult(items=items, say=say)
+               f"Reason: {'; '.join(first.reasons[:2])}.{question}")
+        return PendingResult(items=items, presented=presented, say=say)
 
     def activity(self, att: Attestation, days: int = 7) -> ActivityResult:
         me = self.hh.members.get(att.member_id)
         days = max(1, min(days, 90))
         since = (self.clock() - timedelta(days=days)).isoformat(timespec="seconds")
-        q = "SELECT id FROM actions WHERE created_at >= ? ORDER BY created_at"
-        rows = [self._row(r[0]) for r in self.conn.execute(q, (since,))]
+        acts = [a for a in self._history().values() if a["when"] >= since]
         if me is None:
-            rows = []
+            acts = []
         elif me.role != "guardian":
-            rows = [r for r in rows if r and r.member_id == me.id]
-        lines = [ActivityLine(when=r.created_at, who=self._name(r.member_id), item=r.title, total=r.total,
-                              status=r.status) for r in rows if r]
+            acts = [a for a in acts if a["member"] == me.id]
+        lines = [ActivityLine(when=a["when"], who=self._name(a["member"]),
+                              item=self.catalogue.get(a["item"], {}).get("title", a["item"]),
+                              total=a["total"], status=a["status"]) for a in acts]
         spent = round(sum(line.total for line in lines if line.status == "placed"), 2)
         check = self.ledger.verify()
         placed = sum(1 for line in lines if line.status == "placed")
-        stopped = sum(1 for line in lines if line.status in ("blocked", "declined"))
+        stopped = sum(1 for line in lines if line.status in ("blocked", "declined", "expired"))
         waiting = sum(1 for line in lines if line.status.startswith("needs"))
         integrity = ("The record checks out." if check.ok
                      else f"Warning: the record has been altered at entry {check.first_bad_seq}.")
         say = (f"In the last {days} days: {placed} placed for {self._money(spent)}, {stopped} stopped, "
                f"{waiting} waiting. {integrity}")
         return ActivityResult(days=days, lines=lines, spent=spent, ledger_ok=check.ok, ledger_entries=check.entries,
-                              say=say)
+                              ledger_head=check.head, say=say)
 
     def verify(self) -> LedgerCheck:
         r = self.ledger.verify()

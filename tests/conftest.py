@@ -62,5 +62,7 @@ def svc(tmp_path, household, judge, clock) -> Countersign:
 _turn = iter(range(1, 10_000))
 
 
-def say(member: str, *utterances: str) -> Attestation:
-    return Attestation(member_id=member, turn_id=f"t{next(_turn)}", utterances=list(utterances), issued_at=time.time())
+def say(member: str, *utterances: str, answering: str | None = None) -> Attestation:
+    """One device turn: who spoke, what they said, and which question (if any) they were answering."""
+    return Attestation(member_id=member, turn_id=f"t{next(_turn)}", utterances=list(utterances),
+                       issued_at=time.time(), answering=answering)
