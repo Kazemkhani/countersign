@@ -1,0 +1,32 @@
+[project]
+name = "countersign"
+version = "0.1.0"
+description = "A self-hosted MCP server that puts a household's rules, an intent check and a tamper-evident ledger between a voice assistant and every purchase it makes."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.23,<2",          # 1.23+ speaks MCP spec 2025-11-25; 2.x renamed FastMCP
+  "boto3>=1.40",           # Amazon Bedrock Converse API (intent check)
+  "pydantic>=2.7",
+  "uvicorn>=0.30",
+  "starlette>=0.40",
+]
+
+[project.optional-dependencies]
+simulator = ["strands-agents>=1.20", "httpx>=0.27"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+countersign-server = "countersign.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/countersign"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
