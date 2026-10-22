@@ -125,7 +125,7 @@ Each run saves its results, the judge prompt hash and the cases hash in `eval/re
 | Run (test split, 32 cases) | Mismatches caught                            | Genuine orders passed                       |
 | -------------------------- | -------------------------------------------- | ------------------------------------------- |
 | Rules only (22 Oct 2026)   | 7 of 16, 43.8% (95% interval 19.8% to 70.1%) | 16 of 16, 100% (95% interval 79.4% to 100%) |
-| Rules + Bedrock judge      | _to be filled from eval/results_             | _to be filled from eval/results_            |
+| Rules + Bedrock judge      | not run yet (needs AWS credentials)          | not run yet                                 |
 
 Intervals are two-sided 95% Clopper-Pearson. The rules and the cases were written by the same author, so the rules-only row is indicative, not a held-out result; the rules were revised once after review on 22 Oct and the rerun gave the same counts. The judge prompt has never been run on the test split. The rules alone miss every item and variant mismatch, which is the job of the model judge. The cases are constructed, not real household data, and 32 cases give wide intervals; read them as a smoke test, not a benchmark.
 
